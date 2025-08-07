@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: closet-tracker-bot
+    env: python
+    buildCommand: ""
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        value: YOUR_TELEGRAM_BOT_TOKEN
