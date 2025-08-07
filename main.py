@@ -1,18 +1,27 @@
+import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils import executor
-from aiogram.dispatcher.filters import Command
-from aiogram.dispatcher import FSMContext
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher.filters.state import State, StatesGroup
-import sqlite3
 import os
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime
 
-API_TOKEN = os.getenv("BOT_TOKEN")
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.markdown import hbold
+from aiogram import Router
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 logging.basicConfig(level=logging.INFO)
 
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+
+# === DB INIT ===
 db = sqlite3.connect("closet.db")
 cursor = db.cursor()
 cursor.execute("""
@@ -28,30 +37,28 @@ CREATE TABLE IF NOT EXISTS clothes (
 """)
 db.commit()
 
+# === FSM ===
 class AddClothes(StatesGroup):
     waiting_for_name = State()
     waiting_for_category = State()
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher(bot, storage=MemoryStorage())
+@router.message(commands=["start"])
+async def cmd_start(message: Message):
+    await message.answer("Привет! Я помогу тебе отслеживать одежду. Используй /add для добавления вещей.")
 
-@dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    await message.answer("Привет! Я помогу тебе следить за одеждой. Используй /add чтобы добавить вещь.")
+@router.message(commands=["add"])
+async def cmd_add(message: Message, state: FSMContext):
+    await message.answer("Введи название вещи:")
+    await state.set_state(AddClothes.waiting_for_name)
 
-@dp.message_handler(commands=["add"])
-async def add_cmd(message: types.Message):
-    await message.answer("Введи название вещи (например, 'Футболка H&M'):")
-    await AddClothes.waiting_for_name.set()
-
-@dp.message_handler(state=AddClothes.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
+@router.message(AddClothes.waiting_for_name)
+async def process_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("Укажи категорию (футболка, джинсы и т.д.):")
-    await AddClothes.waiting_for_category.set()
+    await state.set_state(AddClothes.waiting_for_category)
+    await message.answer("Укажи категорию:")
 
-@dp.message_handler(state=AddClothes.waiting_for_category)
-async def process_category(message: types.Message, state: FSMContext):
+@router.message(AddClothes.waiting_for_category)
+async def process_category(message: Message, state: FSMContext):
     data = await state.get_data()
     cursor.execute("""
         INSERT INTO clothes (user_id, name, category, last_worn, last_washed, worn_count)
@@ -59,63 +66,68 @@ async def process_category(message: types.Message, state: FSMContext):
     """, (message.from_user.id, data['name'], message.text))
     db.commit()
     await message.answer(f"Добавлена вещь: {data['name']} ({message.text})")
-    await state.finish()
+    await state.clear()
 
-@dp.message_handler(commands=["wear"])
-async def wear_cmd(message: types.Message):
-    cursor.execute("SELECT id, name FROM clothes WHERE user_id = ?", (message.from_user.id,))
+@router.message(commands=["wear"])
+async def cmd_wear(message: Message):
+    cursor.execute("SELECT name FROM clothes WHERE user_id = ?", (message.from_user.id,))
     items = cursor.fetchall()
     if not items:
-        await message.answer("Ты ещё не добавил вещи. Используй /add")
+        await message.answer("Нет добавленных вещей. Используй /add")
         return
-    buttons = [KeyboardButton(text=item[1]) for item in items]
-    kb = ReplyKeyboardMarkup(resize_keyboard=True).add(*buttons)
+    buttons = [KeyboardButton(text=item[0]) for item in items]
+    kb = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True)
     await message.answer("Что ты надел?", reply_markup=kb)
 
-@dp.message_handler(lambda msg: True, content_types=types.ContentType.TEXT)
-async def mark_worn(message: types.Message):
+@router.message(F.text)
+async def mark_worn(message: Message):
     cursor.execute("SELECT id FROM clothes WHERE user_id = ? AND name = ?", (message.from_user.id, message.text))
-    result = cursor.fetchone()
-    if result:
+    item = cursor.fetchone()
+    if item:
         now = datetime.now().isoformat()
-        cursor.execute("UPDATE clothes SET last_worn = ?, worn_count = worn_count + 1 WHERE id = ?", (now, result[0]))
+        cursor.execute("UPDATE clothes SET last_worn = ?, worn_count = worn_count + 1 WHERE id = ?", (now, item[0]))
         db.commit()
         await message.answer(f"Отмечено: ты носил '{message.text}' сегодня.", reply_markup=types.ReplyKeyboardRemove())
 
-@dp.message_handler(commands=["wash"])
-async def wash_cmd(message: types.Message):
-    cursor.execute("SELECT id, name FROM clothes WHERE user_id = ?", (message.from_user.id,))
+@router.message(commands=["wash"])
+async def cmd_wash(message: Message):
+    cursor.execute("SELECT name FROM clothes WHERE user_id = ?", (message.from_user.id,))
     items = cursor.fetchall()
     if not items:
-        await message.answer("Добавь хотя бы одну вещь через /add")
+        await message.answer("Нет добавленных вещей. Используй /add")
         return
-    buttons = [KeyboardButton(text=item[1]) for item in items]
-    kb = ReplyKeyboardMarkup(resize_keyboard=True).add(*buttons)
+    buttons = [KeyboardButton(text=item[0]) for item in items]
+    kb = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True)
     await message.answer("Что ты постирал?", reply_markup=kb)
 
-@dp.message_handler(commands=["status"])
-async def status_cmd(message: types.Message):
+@router.message(commands=["status"])
+async def cmd_status(message: Message):
     cursor.execute("SELECT name, last_worn, last_washed, worn_count FROM clothes WHERE user_id = ?", (message.from_user.id,))
     rows = cursor.fetchall()
     if not rows:
-        await message.answer("У тебя пока нет вещей. Используй /add")
+        await message.answer("Нет вещей. Используй /add")
         return
-    report = "\n".join([
-        f"👕 {name}:\n  - Надевалось: {worn_count} раз\n  - Последний раз носил: {last_worn or 'никогда'}\n  - Последняя стирка: {last_washed or 'никогда'}" +
-        ("\n  ❗ Пора постирать!" if worn_count >= 3 else "")
-        for name, last_worn, last_washed, worn_count in rows
-    ])
-    await message.answer(report)
+    lines = []
+    for name, worn, washed, count in rows:
+        line = f"👕 <b>{name}</b>\n  - Надевалось: {count} раз\n  - Последний раз носил: {worn or 'никогда'}\n  - Последняя стирка: {washed or 'никогда'}"
+        if count >= 3:
+            line += "\n  ❗ Пора постирать!"
+        lines.append(line)
+    await message.answer("\n\n".join(lines))
 
-@dp.message_handler(lambda msg: True)
-async def mark_washed(message: types.Message):
+@router.message(F.text)
+async def mark_washed(message: Message):
     cursor.execute("SELECT id FROM clothes WHERE user_id = ? AND name = ?", (message.from_user.id, message.text))
-    result = cursor.fetchone()
-    if result:
+    item = cursor.fetchone()
+    if item:
         now = datetime.now().isoformat()
-        cursor.execute("UPDATE clothes SET last_washed = ?, worn_count = 0 WHERE id = ?", (now, result[0]))
+        cursor.execute("UPDATE clothes SET last_washed = ?, worn_count = 0 WHERE id = ?", (now, item[0]))
         db.commit()
-        await message.answer(f"Ок, '{message.text}' теперь чистая!", reply_markup=types.ReplyKeyboardRemove())
+        await message.answer(f"'{message.text}' отмечена как чистая!", reply_markup=types.ReplyKeyboardRemove())
+
+async def main():
+    dp.include_router(router)
+    await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
