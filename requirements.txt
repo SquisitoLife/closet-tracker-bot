@@ -1,1 +1,3 @@
 aiogram==3.4.1
+python-dotenv
+aiohttp==3.9.5
