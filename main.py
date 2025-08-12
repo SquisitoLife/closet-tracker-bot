@@ -24,14 +24,12 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 
-
-# ========= Настройки / Логирование =========
+# ========= Логирование / токен =========
 logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment")
+    raise RuntimeError("BOT_TOKEN is not set")
 
-# В aiogram 3.5+ parse_mode нужно передавать через DefaultBotProperties.
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -39,15 +37,11 @@ bot = Bot(
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-
-# ========= Простой HTTP-сервер (Render Web Service ждёт открытый порт) =========
+# ========= HTTP health (для Render Web Service) =========
 async def _health(_request: web.Request):
     return web.Response(text="OK")
 
 async def run_http_server():
-    """
-    Поднимаем микросервер, чтобы Render видел открытый порт ($PORT).
-    """
     app = web.Application()
     app.router.add_get("/", _health)
     port = int(os.environ.get("PORT", 8080))
@@ -55,10 +49,9 @@ async def run_http_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP health server started on 0.0.0.0:{port}")
+    logging.info(f"HTTP health server on 0.0.0.0:{port}")
 
-
-# ========= База данных =========
+# ========= БД =========
 DB_PATH = "closet.db"
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
@@ -78,8 +71,7 @@ cursor.execute(
 )
 db.commit()
 
-
-# ========= FSM (машины состояний) =========
+# ========= FSM =========
 class AddClothes(StatesGroup):
     waiting_for_name = State()
     waiting_for_category = State()
@@ -90,16 +82,13 @@ class WearFlow(StatesGroup):
 class WashFlow(StatesGroup):
     choosing = State()
 
-
-# ========= Вспомогательные функции =========
+# ========= Утилиты =========
 def build_keyboard_from_items(names: list[str], per_row: int = 2) -> ReplyKeyboardMarkup:
-    rows = []
-    row = []
+    rows, row = [], []
     for i, name in enumerate(names, 1):
         row.append(KeyboardButton(text=name))
         if i % per_row == 0:
-            rows.append(row)
-            row = []
+            rows.append(row); row = []
     if row:
         rows.append(row)
     rows.append([KeyboardButton(text="Отмена")])
@@ -112,22 +101,18 @@ def fetch_user_items(user_id: int) -> list[sqlite3.Row]:
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-
-# ========= Хэндлеры =========
+# ========= Команды =========
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    text = (
-        "Привет! Я помогу отслеживать одежду и стирки.\n\n"
-        "Команды:\n"
+    await message.answer(
+        "Привет! Вот что я умею:\n"
         "• /add — добавить вещь\n"
         "• /wear — отметить, что носил вещь\n"
         "• /wash — отметить, что постирал вещь\n"
-        "• /status — краткий статус по вещам\n"
+        "• /status — статус по вещам\n"
     )
-    await message.answer(text)
 
-
-# ---- Добавление вещи ----
+# --- /add ---
 @router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
     await state.set_state(AddClothes.waiting_for_name)
@@ -137,7 +122,7 @@ async def cmd_add(message: Message, state: FSMContext):
 async def process_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text.strip())
     await state.set_state(AddClothes.waiting_for_category)
-    await message.answer("Укажи категорию (например: футболка, джинсы, носки):")
+    await message.answer("Укажи категорию (футболка, джинсы и т.п.):")
 
 @router.message(AddClothes.waiting_for_category, F.text.len() > 0)
 async def process_category(message: Message, state: FSMContext):
@@ -155,8 +140,7 @@ async def process_category(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Добавлена вещь: <b>{name}</b> ({category})")
 
-
-# ---- Носил вещь (/wear) ----
+# --- /wear (носил) ---
 @router.message(Command("wear"))
 async def cmd_wear(message: Message, state: FSMContext):
     items = fetch_user_items(message.from_user.id)
@@ -173,29 +157,23 @@ async def mark_worn(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
         return
-
     cursor.execute(
         "SELECT id FROM clothes WHERE user_id = ? AND name = ?",
         (message.from_user.id, message.text),
     )
     row = cursor.fetchone()
     if not row:
-        await message.answer("Такой вещи нет в списке. Выбери из клавиатуры или нажми «Отмена».")
+        await message.answer("Нет такой вещи. Выбери из клавиатуры или «Отмена».")
         return
-
     cursor.execute(
         "UPDATE clothes SET last_worn = ?, worn_count = worn_count + 1 WHERE id = ?",
         (now_iso(), row["id"]),
     )
     db.commit()
     await state.clear()
-    await message.answer(
-        f"🧥 Отмечено: носил «{message.text}» сегодня.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer(f"🧥 Отмечено: носил «{message.text}».", reply_markup=ReplyKeyboardRemove())
 
-
-# ---- Постирал вещь (/wash) ----
+# --- /wash (постирал) ---
 @router.message(Command("wash"))
 async def cmd_wash(message: Message, state: FSMContext):
     items = fetch_user_items(message.from_user.id)
@@ -212,29 +190,23 @@ async def mark_washed(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
         return
-
     cursor.execute(
         "SELECT id FROM clothes WHERE user_id = ? AND name = ?",
         (message.from_user.id, message.text),
     )
     row = cursor.fetchone()
     if not row:
-        await message.answer("Такой вещи нет в списке. Выбери из клавиатуры или нажми «Отмена».")
+        await message.answer("Нет такой вещи. Выбери из клавиатуры или «Отмена».")
         return
-
     cursor.execute(
         "UPDATE clothes SET last_washed = ?, worn_count = 0 WHERE id = ?",
         (now_iso(), row["id"]),
     )
     db.commit()
     await state.clear()
-    await message.answer(
-        f"🧼 «{message.text}» отмечена как чистая!",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer(f"🧼 «{message.text}» отмечена как чистая.", reply_markup=ReplyKeyboardRemove())
 
-
-# ---- Статус ----
+# --- /status ---
 @router.message(Command("status"))
 async def cmd_status(message: Message):
     cursor.execute(
@@ -250,7 +222,6 @@ async def cmd_status(message: Message):
     if not rows:
         await message.answer("Пока нет вещей. Добавь через /add")
         return
-
     lines = []
     for r in rows:
         name = r["name"]
@@ -266,18 +237,18 @@ async def cmd_status(message: Message):
         if count >= 3:
             line += "\n  ❗ Пора постирать!"
         lines.append(line)
-
     await message.answer("\n\n".join(lines))
-
 
 # ========= Точка входа =========
 async def main():
-    # поднимаем HTTP health-сервер для Render
     asyncio.create_task(run_http_server())
-
     dp.include_router(router)
-    await dp.start_polling(bot)
-
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=True,
+        handle_signals=False,
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
