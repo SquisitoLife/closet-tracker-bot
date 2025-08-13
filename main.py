@@ -3,9 +3,8 @@ import logging
 import os
 import sqlite3
 from contextlib import suppress
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import List, Optional
 
 from aiohttp import web
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,7 +13,7 @@ from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
@@ -37,10 +36,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("closet-bot")
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
@@ -52,7 +48,6 @@ db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
 cursor = db.cursor()
 
-# clothes: учёт предметов гардероба
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS clothes (
@@ -67,13 +62,12 @@ CREATE TABLE IF NOT EXISTS clothes (
 """
 )
 
-# user_settings: настройки пользователя (уведомления + время + час.пояс)
 cursor.execute(
     """
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id INTEGER PRIMARY KEY,
     notify_on INTEGER DEFAULT 0,           -- 0/1
-    notify_time TEXT DEFAULT '09:00',      -- HH:MM (локальное время пользователя)
+    notify_time TEXT DEFAULT '09:00',      -- HH:MM
     tz TEXT DEFAULT 'Europe/Moscow'        -- IANA TZ
 )
 """
@@ -81,7 +75,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
 db.commit()
 
 # ==========
-# FSM
+# FSM (для добавления)
 # ==========
 class AddClothes(StatesGroup):
     waiting_for_name = State()
@@ -94,14 +88,18 @@ class ChangeTimezone(StatesGroup):
     waiting_for_tz = State()
 
 # =========================
+# Память (режим выбора)
+# =========================
+# user_id -> "wear" | "wash"
+_pending_action: dict[int, str] = {}
+
+# =========================
 # Утилиты
 # =========================
 def now_tz(tz_name: str) -> datetime:
-    """Безопасно получить 'сейчас' в заданном часовом поясе."""
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
-        # Фоллбек на Москву, если TZ не найден в системе
         tz = ZoneInfo("Europe/Moscow")
     return datetime.now(tz)
 
@@ -119,7 +117,6 @@ def get_or_create_user_settings(user_id: int) -> sqlite3.Row:
     return row
 
 def parse_hhmm(text: str) -> Optional[str]:
-    """Проверка формата HH:MM, вернуть нормализованную строку или None."""
     parts = text.strip().split(":")
     if len(parts) != 2:
         return None
@@ -135,12 +132,23 @@ def list_user_items(user_id: int) -> List[str]:
     cursor.execute("SELECT name FROM clothes WHERE user_id = ? ORDER BY name COLLATE NOCASE", (user_id,))
     return [row["name"] for row in cursor.fetchall()]
 
+def chunk_buttons(names: List[str], per_row: int = 3) -> List[List[KeyboardButton]]:
+    rows = []
+    row = []
+    for nm in names:
+        row.append(KeyboardButton(text=nm))
+        if len(row) == per_row:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return rows
+
 def human_date(iso: Optional[str]) -> str:
     if not iso:
         return "никогда"
     try:
         dt = datetime.fromisoformat(iso)
-        # показываем локально в «Москве», чтобы была читаемость
         return dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
         return iso
@@ -158,7 +166,7 @@ async def set_commands():
         BotCommand(command="notify_on", description="Включить напоминания"),
         BotCommand(command="notify_off", description="Выключить напоминания"),
         BotCommand(command="notify_time", description="Время напоминания (HH:MM)"),
-        BotCommand(command="notify_tz", description="Часовой пояс (например Europe/Moscow)"),
+        BotCommand(command="notify_tz", description="Часовой пояс (IANA)"),
         BotCommand(command="help", description="Справка"),
     ]
     await bot.set_my_commands(cmds)
@@ -171,24 +179,24 @@ async def cmd_start(message: Message):
     s = get_or_create_user_settings(message.from_user.id)
     text = (
         "Привет! Я помогу отслеживать гардероб и напомню, когда пора стирать 👕\n\n"
-        "Основные команды:\n"
+        "Команды:\n"
         "• /add — добавить вещь\n"
         "• /wear — отметить, что носил\n"
         "• /wash — отметить, что постирал\n"
         "• /status — текущий статус\n\n"
         "Напоминания:\n"
         "• /notify_on — включить, /notify_off — выключить\n"
-        "• /notify_time — время уведомления (формат HH:MM)\n"
-        "• /notify_tz — часовой пояс (IANA), по умолчанию Europe/Moscow\n\n"
-        f"Сейчас у тебя: уведомления <b>{'включены' if s['notify_on'] else 'выключены'}</b>, "
+        "• /notify_time — время (HH:MM)\n"
+        "• /notify_tz — часовой пояс (например Europe/Moscow)\n\n"
+        f"Сейчас: уведомления <b>{'включены' if s['notify_on'] else 'выключены'}</b>, "
         f"время <b>{s['notify_time']}</b>, TZ <b>{s['tz']}</b>."
     )
     await message.answer(text)
 
 @router.message(F.text == "/add")
 async def cmd_add(message: Message, state: FSMContext):
-    await message.answer("Введи название вещи:")
     await state.set_state(AddClothes.waiting_for_name)
+    await message.answer("Введи название вещи:", reply_markup=ReplyKeyboardRemove())
 
 @router.message(AddClothes.waiting_for_name)
 async def add_name(message: Message, state: FSMContext):
@@ -199,7 +207,7 @@ async def add_name(message: Message, state: FSMContext):
 @router.message(AddClothes.waiting_for_category)
 async def add_category(message: Message, state: FSMContext):
     data = await state.get_data()
-    name = data.get("name")
+    name = data.get("name").strip()
     category = message.text.strip()
     cursor.execute(
         """
@@ -209,28 +217,8 @@ async def add_category(message: Message, state: FSMContext):
         (message.from_user.id, name, category),
     )
     db.commit()
-    await message.answer(f"Добавлено: <b>{name}</b> ({category})")
     await state.clear()
-
-@router.message(F.text == "/wear")
-async def cmd_wear(message: Message):
-    items = list_user_items(message.from_user.id)
-    if not items:
-        await message.answer("Нет добавленных вещей. Используй /add")
-        return
-    buttons = [KeyboardButton(text=nm) for nm in items]
-    kb = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True)
-    await message.answer("Что ты <b>носил</b>?", reply_markup=kb)
-
-@router.message(F.text == "/wash")
-async def cmd_wash(message: Message):
-    items = list_user_items(message.from_user.id)
-    if not items:
-        await message.answer("Нет добавленных вещей. Используй /add")
-        return
-    buttons = [KeyboardButton(text=nm) for nm in items]
-    kb = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True)
-    await message.answer("Что ты <b>постирал</b>?", reply_markup=kb)
+    await message.answer(f"Добавлено: <b>{name}</b> ({category})")
 
 @router.message(F.text == "/status")
 async def cmd_status(message: Message):
@@ -248,22 +236,87 @@ async def cmd_status(message: Message):
         worn = human_date(row["last_worn"])
         washed = human_date(row["last_washed"])
         count = row["worn_count"]
-        line = f"👕 <b>{name}</b>\n  — Надевалось: {count} раз\n  — Последний раз носил: {worn}\n  — Последняя стирка: {washed}"
+        line = (
+            f"👕 <b>{name}</b>\n"
+            f"  — Надевалось: {count} раз\n"
+            f"  — Последний раз носил: {worn}\n"
+            f"  — Последняя стирка: {washed}"
+        )
         if count >= 3:
             line += "\n  ❗ Похоже, стоит постирать 🙂"
         lines.append(line)
     await message.answer("\n\n".join(lines))
 
+# ----- wear / wash упрощённая логика -----
+@router.message(F.text == "/wear")
+async def cmd_wear(message: Message):
+    items = list_user_items(message.from_user.id)
+    if not items:
+        await message.answer("Нет добавленных вещей. Используй /add")
+        return
+    _pending_action[message.from_user.id] = "wear"
+    kb = ReplyKeyboardMarkup(keyboard=chunk_buttons(items, 3), resize_keyboard=True)
+    await message.answer("Выбери вещь, которую ты <b>носил</b>:", reply_markup=kb)
+
+@router.message(F.text == "/wash")
+async def cmd_wash(message: Message):
+    items = list_user_items(message.from_user.id)
+    if not items:
+        await message.answer("Нет добавленных вещей. Используй /add")
+        return
+    _pending_action[message.from_user.id] = "wash"
+    kb = ReplyKeyboardMarkup(keyboard=chunk_buttons(items, 3), resize_keyboard=True)
+    await message.answer("Выбери вещь, которую ты <b>постирал</b>:", reply_markup=kb)
+
+@router.message(F.text)
+async def handle_item_click(message: Message):
+    """Если пользователь в режиме wear/wash и нажал название вещи — применяем действие."""
+    user_id = message.from_user.id
+    action = _pending_action.get(user_id)
+    if not action:
+        return  # не ждём выбора — игнорируем
+
+    name = message.text.strip()
+    cursor.execute("SELECT id FROM clothes WHERE user_id = ? AND name = ?", (user_id, name))
+    row = cursor.fetchone()
+    if not row:
+        return  # не наша кнопка
+
+    now_iso = datetime.now().isoformat(timespec="minutes")
+    if action == "wear":
+        cursor.execute(
+            "UPDATE clothes SET last_worn = ?, worn_count = worn_count + 1 WHERE user_id = ? AND name = ?",
+            (now_iso, user_id, name),
+        )
+        db.commit()
+        await message.answer(
+            f"Отмечено: ты носил «{name}» сегодня.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    elif action == "wash":
+        cursor.execute(
+            "UPDATE clothes SET last_washed = ?, worn_count = 0 WHERE user_id = ? AND name = ?",
+            (now_iso, user_id, name),
+        )
+        db.commit()
+        await message.answer(
+            f"Отмечено: «{name}» постирана!",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+    # очистим режим
+    _pending_action.pop(user_id, None)
+
+# ----- уведомления -----
 @router.message(F.text.in_({"/notify_on", "/notify_off"}))
 async def toggle_notify(message: Message):
-    s = get_or_create_user_settings(message.from_user.id)
     on = 1 if message.text == "/notify_on" else 0
     cursor.execute("UPDATE user_settings SET notify_on = ? WHERE user_id = ?", (on, message.from_user.id))
     db.commit()
-    s2 = get_or_create_user_settings(message.from_user.id)
+    s = get_or_create_user_settings(message.from_user.id)
     await message.answer(
-        f"Уведомления <b>{'включены' if s2['notify_on'] else 'выключены'}</b>. "
-        f"Время: <b>{s2['notify_time']}</b>, TZ: <b>{s2['tz']}</b>"
+        f"Уведомления <b>{'включены' if s['notify_on'] else 'выключены'}</b>. "
+        f"Время: <b>{s['notify_time']}</b>, TZ: <b>{s['tz']}</b>"
     )
 
 @router.message(F.text == "/notify_time")
@@ -288,15 +341,15 @@ async def ask_tz(message: Message, state: FSMContext):
     await state.set_state(ChangeTimezone.waiting_for_tz)
     await message.answer(
         "Введи часовой пояс (IANA), например: <code>Europe/Moscow</code>, <code>Europe/Berlin</code>, "
-        "<code>Asia/Almaty</code>.\nСписок можно посмотреть на https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
-        reply_markup=ReplyKeyboardRemove()
+        "<code>Asia/Almaty</code>.\nСписок: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 @router.message(ChangeTimezone.waiting_for_tz)
 async def set_tz(message: Message, state: FSMContext):
     tz_candidate = message.text.strip()
     try:
-        _ = ZoneInfo(tz_candidate)  # проверка
+        _ = ZoneInfo(tz_candidate)
     except Exception:
         await message.answer("Не удалось распознать TZ. Пример: Europe/Moscow. Попробуй ещё раз.")
         return
@@ -306,91 +359,6 @@ async def set_tz(message: Message, state: FSMContext):
     s = get_or_create_user_settings(message.from_user.id)
     await message.answer(f"Готово! TZ: <b>{s['tz']}</b>. Время напоминания: <b>{s['notify_time']}</b>.")
 
-# Обработчик любого текста для выбора предметов под /wear или /wash
-@router.message(F.text)
-async def handle_item_selection(message: Message):
-    txt = message.text.strip()
-    # проверим, есть ли такая вещь
-    cursor.execute(
-        "SELECT id, name FROM clothes WHERE user_id = ? AND name = ?",
-        (message.from_user.id, txt),
-    )
-    row = cursor.fetchone()
-    if not row:
-        # просто игнорируем — возможно, пользователь пишет обычный текст
-        return
-
-    # Определим, в каком «режиме» пользователь был последним: носил или стирал.
-    # Простой способ: считаем, что если последняя команда была /wear — пользователь выбрал из клавиатуры ответ;
-    # но мы не храним последнее состояние. Поэтому примем логику:
-    # Если недавно бот просил «Что ты носил?» — у пользователя в клавиатуре сейчас кнопки.
-    # Упростим: если текст кнопки выбран после команды /wear — пользователь отмечает «носил».
-    # Для надёжности добавим подсказку в ответах:
-
-    # Чтобы не усложнять — попробуем определить по «последнему отправленному ботом prompt» невозможно в чистом виде.
-    # Поэтому — логика: если предмет найден, спрашиваем пользователя уточнение инлайн-кнопками.
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Носил"), KeyboardButton(text="Постирал")]],
-        resize_keyboard=True,
-    )
-    await message.answer(
-        f"Что сделать с «{txt}»?\n\nНажми «Носил» или «Постирал».",
-        reply_markup=kb,
-    )
-
-    # Сохраним выбранный предмет во временной «сессии» через простую таблицу/в памяти?
-    # Чтобы не городить ещё таблицу — хранить это в оперативке по user_id.
-
-# В оперативной памяти — последняя «выбранная вещь» для подтверждения wear/wash.
-_last_selected_item: dict[int, str] = {}
-
-@router.message(F.text.in_({"Носил", "Постирал"}))
-async def confirm_action(message: Message):
-    # Чтобы узнать предмет — придётся посмотреть последнее сообщение в истории.
-    # Упростим: попросим пользователя прислать ещё раз название вещи, если мы его не знаем.
-    # Но лучше запоминать «предыдущий» запрос. Для простоты используем _last_selected_item:
-    user_id = message.from_user.id
-    if user_id not in _last_selected_item:
-        await message.answer("Сначала выбери вещь из списка, затем подтвердите действие.", reply_markup=ReplyKeyboardRemove())
-        return
-
-    item_name = _last_selected_item.pop(user_id)
-    if message.text == "Носил":
-        # Обновим last_worn и +1 worn_count
-        now_iso = datetime.now().isoformat(timespec="minutes")
-        cursor.execute(
-            "UPDATE clothes SET last_worn = ?, worn_count = worn_count + 1 WHERE user_id = ? AND name = ?",
-            (now_iso, user_id, item_name),
-        )
-        db.commit()
-        await message.answer(
-            f"Отмечено: ты носил «{item_name}» сегодня.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-    else:
-        # Постирал
-        now_iso = datetime.now().isoformat(timespec="minutes")
-        cursor.execute(
-            "UPDATE clothes SET last_washed = ?, worn_count = 0 WHERE user_id = ? AND name = ?",
-            (now_iso, user_id, item_name),
-        )
-        db.commit()
-        await message.answer(
-            f"Отмечено: «{item_name}» постирана!",
-            reply_markup=ReplyKeyboardRemove()
-        )
-
-# Перехват перед нажатием «Носил/Постирал»: сохраняем выбранный предмет
-@router.message()
-async def remember_last_item(message: Message):
-    # если приходит текст, совпадающий с существующей вещью — запомним
-    txt = message.text.strip()
-    cursor.execute("SELECT 1 FROM clothes WHERE user_id = ? AND name = ?", (message.from_user.id, txt))
-    if cursor.fetchone():
-        _last_selected_item[message.from_user.id] = txt
-    # дальше ничего не делаем — это «скрытый» обработчик
-
-
 # =========================
 # Напоминания
 # =========================
@@ -398,9 +366,8 @@ REMIND_WORN_NOT_WASHED_DAYS = 7
 REMIND_CLEAN_NOT_WORN_DAYS = 30
 
 async def reminders_loop():
-    """Проверяем каждую минуту, кому пора отправить напоминание."""
-    await asyncio.sleep(5)  # небольшая пауза после старта
-    sent_guard = {}  # (user_id, date_str) -> True (чтобы не спамить в эту минуту)
+    await asyncio.sleep(5)
+    sent_guard = {}  # (user_id, 'YYYY-MM-DD HH:MM')
 
     while True:
         try:
@@ -409,21 +376,21 @@ async def reminders_loop():
             for s in users:
                 user_id = s["user_id"]
                 tz = s["tz"]
-                t = s["notify_time"]  # "HH:MM"
+                t = s["notify_time"]
+
                 try:
                     now_local = now_tz(tz)
                 except Exception:
                     now_local = now_tz("Europe/Moscow")
-                hhmm_now = now_local.strftime("%H:%M")
 
+                hhmm_now = now_local.strftime("%H:%M")
                 if hhmm_now != t:
-                    continue  # наступит позже
+                    continue
 
                 guard_key = (user_id, now_local.strftime("%Y-%m-%d %H:%M"))
                 if sent_guard.get(guard_key):
                     continue
 
-                # Соберём, что стоит напомнить
                 cursor.execute(
                     "SELECT name, last_worn, last_washed FROM clothes WHERE user_id = ? ORDER BY name COLLATE NOCASE",
                     (user_id,),
@@ -435,28 +402,24 @@ async def reminders_loop():
                     last_worn = row["last_worn"]
                     last_washed = row["last_washed"]
 
-                    # 1) если вещь носили и ещё не стирали — напомнить через 7 дней
+                    # 1) носил, но не стирал 7 дней
                     if last_worn and (not last_washed or last_washed < last_worn):
                         try:
                             dt_worn = datetime.fromisoformat(last_worn)
                         except Exception:
-                            continue
-                        if datetime.utcnow() >= (dt_worn + timedelta(days=REMIND_WORN_NOT_WASHED_DAYS)):
+                            dt_worn = None
+                        if dt_worn and datetime.utcnow() >= (dt_worn + timedelta(days=REMIND_WORN_NOT_WASHED_DAYS)):
                             need_lines.append(f"• «{name}»: давно носил — самое время постирать!")
 
-                    # 2) если вещь чистая (есть last_washed >= last_worn или last_worn пусто) и её не надевали 30 дней — «вспомнить»
+                    # 2) чистая вещь и давно не надевал (30 дней)
                     base = last_washed or last_worn
                     if base:
                         try:
                             dt_base = datetime.fromisoformat(base)
                         except Exception:
-                            continue
-                        if datetime.utcnow() >= (dt_base + timedelta(days=REMIND_CLEAN_NOT_WORN_DAYS)):
+                            dt_base = None
+                        if dt_base and datetime.utcnow() >= (dt_base + timedelta(days=REMIND_CLEAN_NOT_WORN_DAYS)):
                             need_lines.append(f"• «{name}»: давно не надевал — загляни в шкаф 😉")
-                    else:
-                        # Вообще никогда не носили/стирали — если 30 дней с момента добавления? (даты нет)
-                        # Пропускаем.
-                        pass
 
                 if need_lines:
                     text = "Напоминание 👇\n\n" + "\n".join(need_lines)
@@ -471,14 +434,13 @@ async def reminders_loop():
         await asyncio.sleep(60)
 
 # =========================
-# Keep-alive веб‑сервер для Render
+# Keep-alive веб-сервер для Render
 # =========================
 async def handle_root(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 async def run_keepalive():
     app = web.Application()
-    # ВАЖНО: правильная регистрация хэндлеров
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_root)
 
@@ -504,7 +466,6 @@ async def main():
     dp.include_router(router)
     await set_commands()
 
-    # Фоновые задачи: напоминания + keep-alive HTTP
     keepalive_task = asyncio.create_task(run_keepalive())
     reminders_task = asyncio.create_task(reminders_loop())
 
